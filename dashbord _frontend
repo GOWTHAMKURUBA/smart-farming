@@ -1,0 +1,994 @@
+# =============================================
+# 🍅🌿 Smart Farm Dashboard — FINAL VERSION
+# Updated: CSV parser fixed for plant numbers
+# Plants  : Regular Tomato, Cherry Tomato,
+#           Roma Tomato, Mint
+# Soils   : Red Soil, Clay, Loamy
+# Location: Pot, Garden Bed, Open Ground
+# Size    : Small, Medium, Large
+# Pump    : 150ml per 10 seconds (FIXED)
+# Moisture: Calibrated (Dry:860, Wet:382)
+# =============================================
+
+from flask import Flask, jsonify, \
+    render_template_string, request
+import serial
+import joblib
+import pandas as pd
+import threading
+import time
+from datetime import datetime
+
+app   = Flask(__name__)
+model = joblib.load('farm_model.pkl')
+
+# ---- Encodings ----
+PLANT_ENC = {
+    'Regular Tomato': 0,
+    'Cherry Tomato' : 1,
+    'Roma Tomato'   : 2,
+    'Mint'          : 3
+}
+PLANT_NAMES = {
+    '0': 'Regular Tomato',
+    '1': 'Cherry Tomato',
+    '2': 'Roma Tomato',
+    '3': 'Mint'
+}
+PLANT_CMD = {
+    'Regular Tomato': 'PLANT:TOMATO',
+    'Cherry Tomato' : 'PLANT:CHERRY',
+    'Roma Tomato'   : 'PLANT:ROMA',
+    'Mint'          : 'PLANT:MINT'
+}
+SOIL_ENC     = {'Red Soil':0,'Clay':1,'Loamy':2}
+SOIL_CMD     = {
+    'Red Soil': 'SOIL:RED',
+    'Clay'    : 'SOIL:CLAY',
+    'Loamy'   : 'SOIL:LOAMY'
+}
+LOCATION_ENC = {'Pot':0,'Garden Bed':1,'Open Ground':2}
+LOCATION_CMD = {
+    'Pot'         : 'LOC:POT',
+    'Garden Bed'  : 'LOC:GARDEN',
+    'Open Ground' : 'LOC:GROUND'
+}
+SIZE_ENC = {'Small':0,'Medium':1,'Large':2}
+SIZE_CMD  = {
+    'Small' : 'SIZE:SMALL',
+    'Medium': 'SIZE:MEDIUM',
+    'Large' : 'SIZE:LARGE'
+}
+
+# ---- Pump Rate ----
+MS_PER_ML = 166.67 
+
+# ---- Global Data ----
+sensor_data = {
+    "selected_plant"  : "Regular Tomato",
+    "soil_type"       : "Loamy",
+    "location"        : "Pot",
+    "plant_size"      : "Small",
+    "tomato_moisture" : 0,
+    "mint_moisture"   : 0,
+    "temperature"     : 0,
+    "humidity"        : 0,
+    "water_needed"    : 0,
+    "pump_seconds"    : 0,
+    "pump_minutes"    : "",
+    "health_score"    : 0,
+    "health_status"   : "Starting...",
+    "action"          : "Starting...",
+    "action_color"    : "#e65100",
+    "last_updated"    : "Never",
+    "times_watered"   : 0,
+    "total_water"     : 0,
+    "pump_status"     : "STANDBY",
+    "history"         : [],
+    "watering_log"    : []
+}
+
+arduino_conn = None
+
+# ==========================================
+# ML PREDICTION
+# ==========================================
+def predict_water(plant, soil, temp, hum,
+                  soil_type, location, size):
+    try:
+        inp = pd.DataFrame(
+            [[soil, temp, hum,
+              PLANT_ENC[plant],
+              SOIL_ENC[soil_type],
+              LOCATION_ENC[location],
+              SIZE_ENC[size]]],
+            columns=['soil_moisture','temperature',
+                     'humidity','plant_encoded',
+                     'soil_encoded','location_encoded',
+                     'size_encoded'])
+        return max(0, round(model.predict(inp)[0], 1))
+    except Exception as e:
+        print(f"Prediction error: {e}")
+        return 0
+
+# ==========================================
+# HEALTH SCORE
+# ==========================================
+def calculate_health(soil, temp, hum, plant):
+    score = 100
+    dry = 50 if 'Mint' in plant else 40
+    wet = 75 if 'Mint' in plant else 70
+
+    if soil < dry - 20:  score -= 40
+    elif soil < dry:     score -= 20
+    elif soil > wet:     score -= 15
+    if temp > 38:        score -= 30
+    elif temp > 35:      score -= 15
+    if hum > 80:         score -= 20
+    elif hum < 30:       score -= 10
+    score = max(0, score)
+
+    if score >= 80:   status = "🌟 Excellent!"
+    elif score >= 60: status = "✅ Good"
+    elif score >= 40: status = "⚠️ Needs Attention"
+    else:             status = "🚨 Critical!"
+    return score, status
+
+# ==========================================
+# SEND COMMAND TO ARDUINO
+# ==========================================
+def send_to_arduino(cmd):
+    try:
+        if arduino_conn and arduino_conn.is_open:
+            arduino_conn.write(f"{cmd}\n".encode())
+            print(f"→ Arduino: {cmd}")
+    except Exception as e:
+        print(f"Send error: {e}")
+
+# ==========================================
+# READ ARDUINO
+# ==========================================
+def read_arduino():
+    global arduino_conn
+    try:
+        arduino_conn = serial.Serial(
+            'COM12', 9600, timeout=2)
+        time.sleep(2)
+        print("✅ Arduino connected on COM17!")
+
+        while True:
+            try:
+                line = arduino_conn.readline()\
+                    .decode('utf-8').strip()
+
+                if not line:
+                    continue
+
+                # ---- Parse CSV Data ----
+                if line.startswith('CSV,'):
+                    parts = line.split(',')
+                    if len(parts) >= 7:
+                        # Plant number from Arduino
+                        plant_num = parts[2]
+                        tomato = float(parts[3])
+                        mint   = float(parts[4])
+                        temp   = float(parts[5])
+                        hum    = float(parts[6])
+
+                        # Use selected plant from dashboard
+                        plant = sensor_data["selected_plant"]
+                        soil  = tomato if plant != 'Mint' \
+                                else mint
+
+                        # ML Prediction
+                        water = predict_water(
+                            plant, soil, temp, hum,
+                            sensor_data["soil_type"],
+                            sensor_data["location"],
+                            sensor_data["plant_size"])
+
+                        # Pump duration — NO LIMIT!
+                        dur_ms  = water * MS_PER_ML
+                        dur_sec = round(dur_ms / 1000, 1)
+                        dur_min = ""
+                        if dur_sec > 60:
+                            dur_min = f"({round(dur_sec/60,1)} min)"
+
+                        # Health score
+                        score, status = calculate_health(
+                            soil, temp, hum, plant)
+
+                        # Action message
+                        if water > 500:
+                            action = "🚨 Water Immediately!"
+                            color  = "#c62828"
+                        elif water > 200:
+                            action = "⚠️ Water Soon"
+                            color  = "#e65100"
+                        elif water > 100:
+                            action = "👀 Monitor Closely"
+                            color  = "#f57f17"
+                        else:
+                            action = "✅ No Watering Needed"
+                            color  = "#2e7d32"
+
+                        now = datetime.now()\
+                            .strftime("%H:%M:%S")
+
+                        sensor_data.update({
+                            "tomato_moisture" : tomato,
+                            "mint_moisture"   : mint,
+                            "temperature"     : temp,
+                            "humidity"        : hum,
+                            "water_needed"    : water,
+                            "pump_seconds"    : dur_sec,
+                            "pump_minutes"    : dur_min,
+                            "health_score"    : score,
+                            "health_status"   : status,
+                            "action"          : action,
+                            "action_color"    : color,
+                            "last_updated"    : now
+                        })
+
+                        sensor_data["history"].append({
+                            "time"  : now,
+                            "tomato": tomato,
+                            "mint"  : mint
+                        })
+                        if len(sensor_data["history"]) > 20:
+                            sensor_data["history"].pop(0)
+
+                        print(f"[{now}] {plant} | "
+                              f"T:{tomato}% M:{mint}% | "
+                              f"{temp}C {hum}% | "
+                              f"💧{water}ml ({dur_sec}s)")
+
+                # ---- Detect Pump Events ----
+                elif "PUMP STARTING" in line:
+                    sensor_data["pump_status"] = "RUNNING 💧"
+                    sensor_data["times_watered"] += 1
+                    sensor_data["total_water"] += \
+                        sensor_data["water_needed"]
+                    sensor_data["watering_log"].append({
+                        "time" : datetime.now()
+                                 .strftime("%H:%M:%S"),
+                        "plant": sensor_data["selected_plant"],
+                        "water": sensor_data["water_needed"],
+                        "sec"  : sensor_data["pump_seconds"]
+                    })
+                    if len(sensor_data["watering_log"]) > 10:
+                        sensor_data["watering_log"].pop(0)
+                    print("💧 Pump started!")
+
+                elif "PUMP COMPLETE" in line:
+                    sensor_data["pump_status"] = "STANDBY ✅"
+                    print("✅ Pump complete!")
+
+            except UnicodeDecodeError:
+                pass
+            except Exception as e:
+                pass
+
+    except Exception as e:
+        print(f"❌ Arduino error: {e}")
+        print("🔄 Running in DEMO mode...")
+        _demo_mode()
+
+# ==========================================
+# DEMO MODE (when Arduino not connected)
+# ==========================================
+def _demo_mode():
+    import random
+    while True:
+        tomato = round(random.uniform(10, 90), 1)
+        mint   = round(random.uniform(10, 90), 1)
+        temp   = round(random.uniform(28, 35), 1)
+        hum    = round(random.uniform(45, 65), 1)
+        plant  = sensor_data["selected_plant"]
+        soil   = tomato if plant != 'Mint' else mint
+
+        water = predict_water(
+            plant, soil, temp, hum,
+            sensor_data["soil_type"],
+            sensor_data["location"],
+            sensor_data["plant_size"])
+
+        dur_sec = round(water * MS_PER_ML / 1000, 1)
+        dur_min = f"({round(dur_sec/60,1)} min)" \
+            if dur_sec > 60 else ""
+
+        score, status = calculate_health(
+            soil, temp, hum, plant)
+
+        if water > 500:
+            action,color = "🚨 Water Immediately!","#c62828"
+        elif water > 200:
+            action,color = "⚠️ Water Soon","#e65100"
+        elif water > 100:
+            action,color = "👀 Monitor Closely","#f57f17"
+        else:
+            action,color = "✅ No Watering Needed","#2e7d32"
+
+        now = datetime.now().strftime("%H:%M:%S")
+
+        sensor_data.update({
+            "tomato_moisture" : tomato,
+            "mint_moisture"   : mint,
+            "temperature"     : temp,
+            "humidity"        : hum,
+            "water_needed"    : water,
+            "pump_seconds"    : dur_sec,
+            "pump_minutes"    : dur_min,
+            "health_score"    : score,
+            "health_status"   : status,
+            "action"          : action,
+            "action_color"    : color,
+            "last_updated"    : now
+        })
+        sensor_data["history"].append({
+            "time": now, "tomato": tomato, "mint": mint
+        })
+        if len(sensor_data["history"]) > 20:
+            sensor_data["history"].pop(0)
+        time.sleep(5)
+
+# ==========================================
+# API ROUTES
+# ==========================================
+@app.route('/api')
+def api():
+    return jsonify(sensor_data)
+
+@app.route('/update_settings', methods=['POST'])
+def update_settings():
+    data = request.json
+
+    if 'plant' in data:
+        sensor_data["selected_plant"] = data['plant']
+        send_to_arduino(
+            PLANT_CMD.get(data['plant'], 'PLANT:TOMATO'))
+
+    if 'soil' in data:
+        sensor_data["soil_type"] = data['soil']
+        send_to_arduino(
+            SOIL_CMD.get(data['soil'], 'SOIL:LOAMY'))
+
+    if 'location' in data:
+        sensor_data["location"] = data['location']
+        send_to_arduino(
+            LOCATION_CMD.get(data['location'], 'LOC:POT'))
+
+    if 'size' in data:
+        sensor_data["plant_size"] = data['size']
+        send_to_arduino(
+            SIZE_CMD.get(data['size'], 'SIZE:SMALL'))
+
+    print(f"✅ Settings → "
+          f"{sensor_data['selected_plant']} | "
+          f"{sensor_data['soil_type']} | "
+          f"{sensor_data['location']} | "
+          f"{sensor_data['plant_size']}")
+
+    return jsonify({"status": "ok"})
+
+# ==========================================
+# DASHBOARD HTML
+# ==========================================
+@app.route('/')
+def dashboard():
+    return render_template_string('''
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width,initial-scale=1">
+  <title>🌱 Smart Farm</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{
+      font-family:'Segoe UI',Arial,sans-serif;
+      background:linear-gradient(135deg,#e8f5e9,#f1f8e9);
+      min-height:100vh;padding:12px;
+    }
+    .header{
+      background:linear-gradient(135deg,#1b5e20,#388e3c);
+      color:white;padding:16px 20px;border-radius:18px;
+      margin-bottom:12px;text-align:center;
+      box-shadow:0 6px 20px rgba(27,94,32,0.3);
+    }
+    .header h1{font-size:1.5em;font-weight:800}
+    .header p{font-size:0.8em;opacity:0.8;margin-top:4px}
+    .updated{font-size:0.75em;opacity:0.7;margin-top:4px}
+    .grid{display:flex;flex-direction:column;
+          align-items:center;gap:12px}
+    .card{background:white;border-radius:18px;
+          padding:18px;width:100%;max-width:400px;
+          box-shadow:0 4px 20px rgba(0,0,0,0.08);
+          border:1px solid rgba(0,0,0,0.04)}
+    .card-header{display:flex;align-items:center;
+                 gap:8px;margin-bottom:14px;
+                 padding-bottom:10px;
+                 border-bottom:2px solid #f0f0f0}
+    .card-icon{font-size:1.5em}
+    .card-title{font-size:1.05em;font-weight:700;color:#222}
+    .card-badge{margin-left:auto;font-size:0.7em;
+                background:#e8f5e9;color:#2e7d32;
+                padding:3px 8px;border-radius:20px;
+                font-weight:600}
+    .select-grid{display:grid;
+                 grid-template-columns:1fr 1fr;gap:10px}
+    .select-group label{font-size:0.75em;color:#666;
+                        font-weight:700;display:block;
+                        margin-bottom:4px}
+    select{width:100%;padding:10px;border-radius:10px;
+           border:2px solid #e8f5e9;font-size:0.85em;
+           background:white;color:#333;cursor:pointer;
+           transition:all 0.3s;appearance:none}
+    select:focus{outline:none;border-color:#388e3c}
+    .chips{display:flex;flex-wrap:wrap;
+           gap:6px;margin-top:12px}
+    .chip{background:linear-gradient(135deg,#e8f5e9,#f1f8e9);
+          border:1px solid #c8e6c9;border-radius:20px;
+          padding:5px 12px;font-size:0.75em;
+          color:#2e7d32;font-weight:600}
+    .moisture-row{display:flex;gap:10px;margin-top:4px}
+    .moisture-box{flex:1;border-radius:14px;
+                  padding:14px;text-align:center}
+    .moisture-box.tomato{
+      background:linear-gradient(135deg,#ffebee,#ffcdd2)}
+    .moisture-box.mint{
+      background:linear-gradient(135deg,#e8f5e9,#c8e6c9)}
+    .moisture-val{font-size:2.2em;font-weight:800}
+    .moisture-lbl{font-size:0.75em;font-weight:600;
+                  margin-top:4px;opacity:0.8}
+    .moisture-bar-bg{background:rgba(0,0,0,0.1);
+                     border-radius:10px;height:8px;
+                     margin-top:8px;overflow:hidden}
+    .moisture-bar{height:8px;border-radius:10px;
+                  transition:width 0.8s ease}
+    .soil-msg{margin-top:12px;padding:10px 14px;
+              border-radius:12px;text-align:center;
+              font-size:0.9em;font-weight:600}
+    .msg-dry{background:#ffebee;color:#c62828}
+    .msg-wet{background:#e3f2fd;color:#1565c0}
+    .msg-ok{background:#e8f5e9;color:#2e7d32}
+    .env-grid{display:grid;
+              grid-template-columns:1fr 1fr;
+              gap:10px;margin-top:4px}
+    .env-box{border-radius:14px;padding:14px;
+             text-align:center}
+    .env-box.temp{
+      background:linear-gradient(135deg,#fff3e0,#ffe0b2)}
+    .env-box.hum{
+      background:linear-gradient(135deg,#e3f2fd,#bbdefb)}
+    .env-val{font-size:2em;font-weight:800;color:#333}
+    .env-lbl{font-size:0.75em;color:#666;
+             margin-top:4px;font-weight:600}
+    .water-main{
+      background:linear-gradient(135deg,#e3f2fd,#bbdefb);
+      border-radius:14px;padding:18px;
+      text-align:center;margin-bottom:10px}
+    .water-val{font-size:3.5em;font-weight:900;
+               color:#1565c0;line-height:1}
+    .water-unit{font-size:1em;color:#1976d2;
+                font-weight:700;margin-top:4px}
+    .pump-box{
+      background:linear-gradient(135deg,#fff3e0,#ffe0b2);
+      border-radius:14px;padding:14px;
+      text-align:center;margin-bottom:10px}
+    .pump-val{font-size:2em;font-weight:800;color:#e65100}
+    .pump-lbl{font-size:0.8em;color:#bf360c;
+              font-weight:600;margin-top:2px}
+    .pump-min{font-size:0.75em;color:#e65100;margin-top:2px}
+    .action-box{border-radius:14px;padding:14px;
+                text-align:center;font-size:1.05em;
+                font-weight:700;color:white;
+                box-shadow:0 4px 12px rgba(0,0,0,0.15)}
+    .pump-status-box{display:flex;align-items:center;
+                     gap:10px;background:#f8f9fa;
+                     border-radius:12px;padding:12px;
+                     margin-top:10px}
+    .pump-dot{width:12px;height:12px;border-radius:50%;
+              background:#2e7d32;flex-shrink:0}
+    .pump-dot.running{background:#c62828;
+      animation:pulse 1s infinite}
+    @keyframes pulse{
+      0%{opacity:1}50%{opacity:0.3}100%{opacity:1}}
+    .pump-status-text{font-size:0.9em;
+                      font-weight:600;color:#333}
+    .health-wrap{display:flex;align-items:center;
+                 gap:16px;margin-top:4px}
+    .health-circle{width:80px;height:80px;
+                   border-radius:50%;
+                   background:linear-gradient(
+                     135deg,#e8f5e9,#c8e6c9);
+                   display:flex;flex-direction:column;
+                   align-items:center;
+                   justify-content:center;flex-shrink:0;
+                   box-shadow:0 4px 12px rgba(46,125,50,0.2)}
+    .health-num{font-size:1.6em;font-weight:900;
+                color:#2e7d32;line-height:1}
+    .health-out{font-size:0.65em;color:#666}
+    .health-right{flex:1}
+    .health-bar-bg{background:#f0f0f0;border-radius:20px;
+                   height:14px;overflow:hidden}
+    .health-bar{height:14px;border-radius:20px;
+                transition:width 0.8s ease;
+                background:linear-gradient(
+                  to right,#ef5350,#ffd600,#66bb6a)}
+    .health-status{font-size:0.95em;font-weight:700;
+                   margin-top:8px;color:#333}
+    .health-tip{font-size:0.75em;color:#888;margin-top:4px}
+    .stats-row{display:grid;
+               grid-template-columns:1fr 1fr 1fr;
+               gap:8px;margin-top:4px}
+    .stat-box{background:#f8f9fa;border-radius:12px;
+              padding:12px;text-align:center}
+    .stat-val{font-size:1.4em;font-weight:800;color:#333}
+    .stat-lbl{font-size:0.68em;color:#888;margin-top:2px}
+    .log-item{display:flex;justify-content:space-between;
+              align-items:center;padding:8px 12px;
+              background:#f8f9fa;border-radius:10px;
+              margin-top:6px;font-size:0.82em}
+    .log-time{color:#888;font-size:0.85em}
+    .log-plant{font-weight:600;color:#333}
+    .log-water{color:#1565c0;font-weight:700}
+    canvas{width:100%!important;max-height:200px;
+           margin-top:8px}
+    .legend{display:flex;gap:16px;margin-top:8px;
+            justify-content:center}
+    .legend-item{display:flex;align-items:center;
+                 gap:6px;font-size:0.8em;font-weight:600}
+    .legend-dot{width:10px;height:10px;border-radius:50%}
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+</head>
+<body>
+
+<div class="header">
+  <h1>🌱 Smart Farm Dashboard</h1>
+  <p>AI-Powered Plant Watering System</p>
+  <div class="updated" id="updated">Connecting...</div>
+</div>
+
+<div class="grid">
+
+  <!-- Settings -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">⚙️</span>
+      <span class="card-title">Plant Configuration</span>
+      <span class="card-badge">Settings</span>
+    </div>
+    <div class="select-grid">
+      <div class="select-group">
+        <label>🌿 Plant Type</label>
+        <select id="plant" onchange="updateSettings()">
+          <option>Regular Tomato</option>
+          <option>Cherry Tomato</option>
+          <option>Roma Tomato</option>
+          <option>Mint</option>
+        </select>
+      </div>
+      <div class="select-group">
+        <label>🔴 Soil Type</label>
+        <select id="soil" onchange="updateSettings()">
+          <option>Loamy</option>
+          <option>Red Soil</option>
+          <option>Clay</option>
+        </select>
+      </div>
+      <div class="select-group">
+        <label>📍 Location</label>
+        <select id="location" onchange="updateSettings()">
+          <option>Pot</option>
+          <option>Garden Bed</option>
+          <option>Open Ground</option>
+        </select>
+      </div>
+      <div class="select-group">
+        <label>📏 Plant Size</label>
+        <select id="size" onchange="updateSettings()">
+          <option>Small</option>
+          <option>Medium</option>
+          <option>Large</option>
+        </select>
+      </div>
+    </div>
+    <div class="chips" id="chips">
+      <span class="chip">🍅 Regular Tomato</span>
+      <span class="chip">🟢 Loamy</span>
+      <span class="chip">🪴 Pot</span>
+      <span class="chip">🌱 Small</span>
+    </div>
+  </div>
+
+  <!-- Soil Moisture -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">🌱</span>
+      <span class="card-title">Soil Moisture</span>
+      <span class="card-badge" id="active-badge">
+        Tomato Active</span>
+    </div>
+    <div class="moisture-row">
+      <div class="moisture-box tomato">
+        <div class="moisture-val" id="tomato-soil"
+             style="color:#c62828">--</div>
+        <div class="moisture-lbl"
+             style="color:#c62828">🍅 Tomato</div>
+        <div class="moisture-bar-bg">
+          <div class="moisture-bar" id="tomato-bar"
+               style="width:0%;background:#c62828"></div>
+        </div>
+      </div>
+      <div class="moisture-box mint">
+        <div class="moisture-val" id="mint-soil"
+             style="color:#2e7d32">--</div>
+        <div class="moisture-lbl"
+             style="color:#2e7d32">🌿 Mint</div>
+        <div class="moisture-bar-bg">
+          <div class="moisture-bar" id="mint-bar"
+               style="width:0%;background:#2e7d32"></div>
+        </div>
+      </div>
+    </div>
+    <div class="soil-msg msg-ok" id="soil-msg">
+      Loading...</div>
+  </div>
+
+  <!-- Environment -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">🌤️</span>
+      <span class="card-title">Environment</span>
+      <span class="card-badge">Live</span>
+    </div>
+    <div class="env-grid">
+      <div class="env-box temp">
+        <div class="env-val" id="temp"
+             style="color:#e53935">--</div>
+        <div class="env-lbl">🌡️ Temperature °C</div>
+      </div>
+      <div class="env-box hum">
+        <div class="env-val" id="hum"
+             style="color:#1e88e5">--</div>
+        <div class="env-lbl">💧 Humidity %</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ML Prediction -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">🤖</span>
+      <span class="card-title">AI Water Prediction</span>
+      <span class="card-badge">ML Model</span>
+    </div>
+    <div class="water-main">
+      <div class="water-val" id="water">--</div>
+      <div class="water-unit">ml of water needed</div>
+    </div>
+    <div class="pump-box">
+      <div class="pump-val" id="pump-time">--</div>
+      <div class="pump-lbl">⏱️ Pump Run Duration (seconds)</div>
+      <div class="pump-min" id="pump-min"></div>
+    </div>
+    <div class="action-box" id="action"
+         style="background:#e65100">Loading...</div>
+    <div class="pump-status-box">
+      <div class="pump-dot" id="pump-dot"></div>
+      <div class="pump-status-text"
+           id="pump-status">Pump: STANDBY</div>
+    </div>
+  </div>
+
+  <!-- Health Score -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">💚</span>
+      <span class="card-title">Plant Health Score</span>
+    </div>
+    <div class="health-wrap">
+      <div class="health-circle">
+        <div class="health-num" id="health">--</div>
+        <div class="health-out">/100</div>
+      </div>
+      <div class="health-right">
+        <div class="health-bar-bg">
+          <div class="health-bar" id="health-bar"
+               style="width:0%"></div>
+        </div>
+        <div class="health-status"
+             id="health-status">Loading...</div>
+        <div class="health-tip">
+          Based on soil, temperature & humidity</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">📈</span>
+      <span class="card-title">Session Statistics</span>
+    </div>
+    <div class="stats-row">
+      <div class="stat-box">
+        <div class="stat-val" id="times-watered">0</div>
+        <div class="stat-lbl">Times Watered</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val" id="total-water">0</div>
+        <div class="stat-lbl">Total ml Used</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val" id="reading-count">0</div>
+        <div class="stat-lbl">Readings Taken</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Watering Log -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">📋</span>
+      <span class="card-title">Watering History</span>
+    </div>
+    <div id="watering-log">
+      <div style="text-align:center;color:#aaa;
+                  font-size:0.85em;padding:10px">
+        No watering events yet</div>
+    </div>
+  </div>
+
+  <!-- Graph -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-icon">📊</span>
+      <span class="card-title">Live Moisture Graph</span>
+    </div>
+    <canvas id="chart"></canvas>
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-dot"
+             style="background:#c62828"></div>
+        <span>Tomato</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-dot"
+             style="background:#2e7d32"></div>
+        <span>Mint</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+
+<script>
+const ctx = document.getElementById('chart')
+            .getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      {
+        label: 'Tomato',
+        data: [],
+        borderColor: '#c62828',
+        backgroundColor: 'rgba(198,40,40,0.06)',
+        tension: 0.4, fill: true, pointRadius: 3,
+        pointBackgroundColor: '#c62828'
+      },
+      {
+        label: 'Mint',
+        data: [],
+        borderColor: '#2e7d32',
+        backgroundColor: 'rgba(46,125,50,0.06)',
+        tension: 0.4, fill: true, pointRadius: 3,
+        pointBackgroundColor: '#2e7d32'
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      y: {
+        min: 0, max: 100,
+        grid: { color: 'rgba(0,0,0,0.04)' },
+        title: {
+          display: true, text: 'Moisture %',
+          color: '#888', font: { size: 11 }
+        }
+      },
+      x: { grid: { display: false } }
+    }
+  }
+});
+
+const icons = {
+  'Regular Tomato':'🍅','Cherry Tomato':'🍒',
+  'Roma Tomato':'🍅','Mint':'🌿',
+  'Loamy':'🟢','Red Soil':'🔴','Clay':'🟤',
+  'Pot':'🪴','Garden Bed':'🌿','Open Ground':'🌍',
+  'Small':'🌱','Medium':'🌿','Large':'🌳'
+};
+
+let readingCount = 0;
+
+function updateSettings() {
+  const plant    = document.getElementById('plant').value;
+  const soil     = document.getElementById('soil').value;
+  const location = document.getElementById('location').value;
+  const size     = document.getElementById('size').value;
+
+  document.getElementById('chips').innerHTML =
+    `<span class="chip">${icons[plant]||'🌿'} ${plant}</span>
+     <span class="chip">${icons[soil]||'🟤'} ${soil}</span>
+     <span class="chip">${icons[location]||'📍'} ${location}</span>
+     <span class="chip">${icons[size]||'📏'} ${size}</span>`;
+
+  document.getElementById('active-badge')
+    .textContent = plant + ' Active';
+
+  fetch('/update_settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({plant,soil,location,size})
+  });
+}
+
+function update() {
+  fetch('/api').then(r => r.json()).then(d => {
+    readingCount++;
+
+    // Soil
+    document.getElementById('tomato-soil')
+      .textContent = d.tomato_moisture + '%';
+    document.getElementById('mint-soil')
+      .textContent = d.mint_moisture + '%';
+    document.getElementById('tomato-bar')
+      .style.width = d.tomato_moisture + '%';
+    document.getElementById('mint-bar')
+      .style.width = d.mint_moisture + '%';
+
+    let soil = d.selected_plant !== 'Mint' ?
+               d.tomato_moisture : d.mint_moisture;
+    let dry  = d.selected_plant === 'Mint' ? 50 : 40;
+    let wet  = d.selected_plant === 'Mint' ? 75 : 70;
+    let sm   = document.getElementById('soil-msg');
+    if (soil < dry) {
+      sm.className = 'soil-msg msg-dry';
+      sm.textContent = '⚠️ Too Dry — Plant Needs Water!';
+    } else if (soil > wet) {
+      sm.className = 'soil-msg msg-wet';
+      sm.textContent = '💧 Too Wet — Let it Dry!';
+    } else {
+      sm.className = 'soil-msg msg-ok';
+      sm.textContent = '✅ Soil Moisture is Perfect!';
+    }
+
+    // Environment
+    let te = document.getElementById('temp');
+    te.textContent = d.temperature + '°C';
+    te.style.color = d.temperature > 35 ?
+      '#c62828' : '#e53935';
+    document.getElementById('hum')
+      .textContent = d.humidity + '%';
+
+    // Water
+    document.getElementById('water')
+      .textContent = d.water_needed;
+    document.getElementById('pump-time')
+      .textContent = d.pump_seconds + ' sec';
+    document.getElementById('pump-min')
+      .textContent = d.pump_minutes || '';
+
+    // Action
+    let ab = document.getElementById('action');
+    ab.textContent = d.action;
+    ab.style.background = d.action_color;
+
+    // Pump status
+    let dot = document.getElementById('pump-dot');
+    let ps  = document.getElementById('pump-status');
+    if (d.pump_status &&
+        d.pump_status.includes('RUNNING')) {
+      dot.className = 'pump-dot running';
+      ps.textContent = '💧 ' + d.pump_status;
+    } else {
+      dot.className = 'pump-dot';
+      ps.textContent = '⚡ Pump: ' +
+        (d.pump_status || 'STANDBY');
+    }
+
+    // Health
+    document.getElementById('health')
+      .textContent = d.health_score;
+    document.getElementById('health-bar')
+      .style.width = d.health_score + '%';
+    document.getElementById('health-status')
+      .textContent = d.health_status;
+
+    // Stats
+    document.getElementById('times-watered')
+      .textContent = d.times_watered || 0;
+    document.getElementById('total-water')
+      .textContent = Math.round(d.total_water || 0);
+    document.getElementById('reading-count')
+      .textContent = readingCount;
+
+    // Watering log
+    if (d.watering_log && d.watering_log.length > 0) {
+      let html = '';
+      [...d.watering_log].reverse().forEach(log => {
+        html += `
+          <div class="log-item">
+            <span class="log-time">${log.time}</span>
+            <span class="log-plant">${log.plant}</span>
+            <span class="log-water">
+              ${log.water}ml (${log.sec}s)</span>
+          </div>`;
+      });
+      document.getElementById('watering-log')
+        .innerHTML = html;
+    }
+
+    // Updated time
+    document.getElementById('updated')
+      .textContent = '🕐 Last updated: ' + d.last_updated;
+
+    // Chart
+    if (d.history && d.history.length > 0) {
+      chart.data.labels = d.history.map(h => h.time);
+      chart.data.datasets[0].data =
+        d.history.map(h => h.tomato);
+      chart.data.datasets[1].data =
+        d.history.map(h => h.mint);
+      chart.update('none');
+    }
+  });
+}
+
+update();
+setInterval(update, 5000);
+</script>
+</html>
+''')
+
+# ==========================================
+# START
+# ==========================================
+if __name__ == '__main__':
+    t = threading.Thread(
+        target=read_arduino, daemon=True)
+    t.start()
+    time.sleep(2)
+
+    print("\n================================")
+    print("  🌱 Smart Farm Dashboard Final ")
+    print("================================")
+    print("📱 Phone  : http://192.168.0.104:5000")
+    print("💻 Laptop : http://127.0.0.1:5000")
+    print("================================")
+    print("Features:")
+    print("  ✅ 4 plants supported")
+    print("  ✅ 3 soil types")
+    print("  ✅ 3 locations")
+    print("  ✅ 3 plant sizes")
+    print("  ✅ Live soil bars")
+    print("  ✅ AI water prediction")
+    print("  ✅ Correct pump duration")
+    print("  ✅ Pump status indicator")
+    print("  ✅ Plant health score")
+    print("  ✅ Session statistics")
+    print("  ✅ Watering history")
+    print("  ✅ Live moisture graph")
+    print("  ✅ CSV parser fixed")
+    print("================================\n")
+
+    app.run(host='0.0.0.0', port=5000, debug=False)
