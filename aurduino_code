@@ -1,0 +1,319 @@
+// =============================================
+// 🍅🌿 Smart Farm — 1 SOIL SENSOR VERSION
+// One sensor reads whichever plant is selected
+// Move sensor between pots when switching!
+// =============================================
+
+#include <DHT.h>
+
+// ---- Pins ----
+#define SOIL_PIN         A0   // Single sensor!
+#define DHT_PIN           3
+#define DHT_TYPE       DHT22
+#define PUMP_PIN          7
+
+// ---- Calibration ----
+#define SOIL_DRY         860
+#define SOIL_WET         382
+
+// ---- Thresholds ----
+#define TOMATO_DRY        40
+#define TOMATO_WET        70
+#define MINT_DRY          50
+#define MINT_WET          75
+
+// ---- Pump Rate ----
+// 60ml = 10000ms → 1ml = 166.67ms
+#define MS_PER_ML      166.67
+
+// ---- Settings ----
+byte selectedPlant = 0;  // 0=Tomato 1=Cherry 2=Roma 3=Mint
+byte soilType      = 0;  // 0=Loamy  1=Red    2=Clay
+byte location      = 0;  // 0=Pot    1=Garden 2=Ground
+byte plantSize     = 0;  // 0=Small  1=Medium 2=Large
+
+// ---- Counters ----
+int   readingCount  = 0;
+int   wateringCount = 0;
+float totalWaterMl  = 0;
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ==========================================
+// PRINT HELPERS — F() saves RAM
+// ==========================================
+void printPlant() {
+  switch(selectedPlant) {
+    case 0: Serial.print(F("TOMATO"));  break;
+    case 1: Serial.print(F("CHERRY"));  break;
+    case 2: Serial.print(F("ROMA"));    break;
+    case 3: Serial.print(F("MINT"));    break;
+  }
+}
+
+void printSoil() {
+  switch(soilType) {
+    case 0: Serial.print(F("LOAMY")); break;
+    case 1: Serial.print(F("RED"));   break;
+    case 2: Serial.print(F("CLAY"));  break;
+  }
+}
+
+void printLocation() {
+  switch(location) {
+    case 0: Serial.print(F("POT"));    break;
+    case 1: Serial.print(F("GARDEN")); break;
+    case 2: Serial.print(F("GROUND")); break;
+  }
+}
+
+void printSize() {
+  switch(plantSize) {
+    case 0: Serial.print(F("SMALL"));  break;
+    case 1: Serial.print(F("MEDIUM")); break;
+    case 2: Serial.print(F("LARGE"));  break;
+  }
+}
+
+// ==========================================
+// READ SOIL — AVERAGE 10 SAMPLES
+// ==========================================
+int readSoilMoisture() {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(SOIL_PIN);
+    delay(10);
+  }
+  int raw = sum / 10;
+  int moisture = map(raw, SOIL_DRY, SOIL_WET, 0, 100);
+  moisture = constrain(moisture, 0, 100);
+  Serial.print(F("   Raw:")); Serial.print(raw);
+  Serial.print(F(" → ")); Serial.print(moisture);
+  Serial.println(F("%"));
+  return moisture;
+}
+
+// ==========================================
+// WATER PREDICTION
+// ==========================================
+float getWaterNeeded(int soil, float temp, float hum) {
+  float base = 0;
+  switch(selectedPlant) {
+    case 0: base = (100-soil)*2.5+(temp-25)*8.0-(hum-40)*1.5; break;
+    case 1: base = (100-soil)*1.8+(temp-25)*8.0-(hum-40)*1.5; break;
+    case 2: base = (100-soil)*2.2+(temp-25)*8.0-(hum-40)*1.5; break;
+    case 3: base = (100-soil)*3.0+(temp-25)*6.0-(hum-40)*1.2; break;
+  }
+  base = constrain(base, 0, 300);
+
+  float sm = 1.0;
+  switch(soilType) {
+    case 0: sm = 1.0; break;
+    case 1: sm = 1.4; break;
+    case 2: sm = 0.8; break;
+  }
+
+  float lm = 1.0;
+  switch(location) {
+    case 0: lm = 1.0; break;
+    case 1: lm = 2.0; break;
+    case 2: lm = 3.5; break;
+  }
+
+  float szm = 1.0;
+  switch(plantSize) {
+    case 0: szm = 1.0; break;
+    case 1: szm = 1.5; break;
+    case 2: szm = 2.5; break;
+  }
+
+  return constrain(base * sm * lm * szm, 0, 10000);
+}
+
+// ==========================================
+// RUN PUMP — EXACT DURATION NO LIMIT!
+// ==========================================
+void runPump(float waterML) {
+  wateringCount++;
+  totalWaterMl += waterML;
+
+  long duration = (long)(waterML * MS_PER_ML);
+  if (duration < 1000) duration = 1000;
+
+  float seconds = duration / 1000.0;
+
+  Serial.println(F("\n============================"));
+  Serial.println(F("💧 PUMP STARTING"));
+  Serial.println(F("============================"));
+  Serial.print(F("Plant    : ")); printPlant();    Serial.println();
+  Serial.print(F("Soil     : ")); printSoil();     Serial.println();
+  Serial.print(F("Location : ")); printLocation(); Serial.println();
+  Serial.print(F("Size     : ")); printSize();     Serial.println();
+  Serial.print(F("Water    : ")); Serial.print(waterML,1);
+  Serial.println(F(" ml"));
+  Serial.print(F("Duration : ")); Serial.print(seconds,1);
+  Serial.println(F(" sec"));
+  if (seconds > 60) {
+    Serial.print(F("         = "));
+    Serial.print(seconds/60.0,1);
+    Serial.println(F(" min"));
+  }
+  Serial.println(F("============================"));
+
+  digitalWrite(PUMP_PIN, LOW);  // Pump ON
+
+  long elapsed  = 0;
+  long interval = 5000;
+  while (elapsed < duration) {
+    long remaining = (duration - elapsed) / 1000;
+    Serial.print(F("⏱ "));
+    Serial.print(remaining);
+    Serial.println(F(" sec remaining..."));
+    long wait = min((long)interval, duration - elapsed);
+    delay(wait);
+    elapsed += wait;
+  }
+
+  digitalWrite(PUMP_PIN, HIGH); // Pump OFF
+
+  Serial.println(F("\n✅ PUMP COMPLETE!"));
+  Serial.print(F("Delivered : ")); Serial.print(waterML,1);
+  Serial.println(F(" ml"));
+  Serial.print(F("Total     : ")); Serial.print(totalWaterMl,1);
+  Serial.println(F(" ml"));
+  Serial.println(F("============================\n"));
+  Serial.println(F("⏳ Waiting 10 sec..."));
+  delay(10000);
+}
+
+// ==========================================
+// PARSE COMMANDS FROM PYTHON
+// ==========================================
+void parseCommand(String cmd) {
+  cmd.trim();
+  if      (cmd == F("PLANT:TOMATO")) { selectedPlant=0; Serial.println(F("✅ TOMATO")); }
+  else if (cmd == F("PLANT:CHERRY")) { selectedPlant=1; Serial.println(F("✅ CHERRY")); }
+  else if (cmd == F("PLANT:ROMA"))   { selectedPlant=2; Serial.println(F("✅ ROMA")); }
+  else if (cmd == F("PLANT:MINT"))   { selectedPlant=3; Serial.println(F("✅ MINT")); }
+  else if (cmd == F("SOIL:LOAMY"))   { soilType=0; Serial.println(F("✅ LOAMY")); }
+  else if (cmd == F("SOIL:RED"))     { soilType=1; Serial.println(F("✅ RED")); }
+  else if (cmd == F("SOIL:CLAY"))    { soilType=2; Serial.println(F("✅ CLAY")); }
+  else if (cmd == F("LOC:POT"))      { location=0; Serial.println(F("✅ POT")); }
+  else if (cmd == F("LOC:GARDEN"))   { location=1; Serial.println(F("✅ GARDEN")); }
+  else if (cmd == F("LOC:GROUND"))   { location=2; Serial.println(F("✅ GROUND")); }
+  else if (cmd == F("SIZE:SMALL"))   { plantSize=0; Serial.println(F("✅ SMALL")); }
+  else if (cmd == F("SIZE:MEDIUM"))  { plantSize=1; Serial.println(F("✅ MEDIUM")); }
+  else if (cmd == F("SIZE:LARGE"))   { plantSize=2; Serial.println(F("✅ LARGE")); }
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, HIGH);
+  delay(3000);
+
+  Serial.println(F("================================"));
+  Serial.println(F(" Smart Farm v5.0 — 1 SENSOR   "));
+  Serial.println(F("================================"));
+  Serial.println(F(" Pump  : 60ml/10sec            "));
+  Serial.println(F(" Sensor: 1 sensor, move between"));
+  Serial.println(F("         pots when switching!  "));
+  Serial.println(F(" Dry:860  Wet:382              "));
+  Serial.println(F("================================\n"));
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+
+  // Check Python commands
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    parseCommand(cmd);
+  }
+
+  readingCount++;
+
+  Serial.println(F("================================"));
+  Serial.print(F("📊 READING #"));
+  Serial.println(readingCount);
+  Serial.println(F("================================"));
+
+  // STEP 1: Read single sensor
+  Serial.print(F("🌱 Reading sensor ("));
+  printPlant();
+  Serial.println(F(" pot):"));
+  int soilMoisture = readSoilMoisture();
+
+  // STEP 2: Read DHT22
+  float temp = dht.readTemperature();
+  float hum  = dht.readHumidity();
+
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println(F("❌ DHT22 Error!"));
+    delay(3000);
+    return;
+  }
+
+  // STEP 3: Print readings
+  Serial.println(F("\n--- Readings ---"));
+  Serial.print(F("Plant  : ")); printPlant();    Serial.println();
+  Serial.print(F("Soil   : ")); printSoil();     Serial.println();
+  Serial.print(F("Loc    : ")); printLocation(); Serial.println();
+  Serial.print(F("Size   : ")); printSize();     Serial.println();
+  Serial.print(F("Moisture: ")); Serial.print(soilMoisture); Serial.println(F("%"));
+  Serial.print(F("Temp   : ")); Serial.print(temp,1); Serial.println(F("C"));
+  Serial.print(F("Hum    : ")); Serial.print(hum,1);  Serial.println(F("%"));
+
+  // STEP 4: Thresholds for selected plant
+  int dryThresh = (selectedPlant == 3) ? MINT_DRY : TOMATO_DRY;
+  int wetThresh = (selectedPlant == 3) ? MINT_WET : TOMATO_WET;
+
+  Serial.print(F("Dry    : ")); Serial.print(dryThresh); Serial.println(F("%"));
+  Serial.print(F("Wet    : ")); Serial.print(wetThresh); Serial.println(F("%"));
+
+  // STEP 5: Check and water
+  if (soilMoisture < dryThresh) {
+    float water = getWaterNeeded(soilMoisture, temp, hum);
+    Serial.println(F("\n🌵 TOO DRY!"));
+    Serial.print(F("Water: ")); Serial.print(water,1);
+    Serial.println(F(" ml"));
+    runPump(water);
+
+    // Re-read after pumping
+    Serial.println(F("🔄 Re-reading..."));
+    int newSoil = readSoilMoisture();
+    Serial.print(F("Before: ")); Serial.print(soilMoisture); Serial.println(F("%"));
+    Serial.print(F("After : ")); Serial.print(newSoil);      Serial.println(F("%"));
+    if (newSoil >= dryThresh) {
+      Serial.println(F("✅ Moisture restored!"));
+    } else {
+      Serial.println(F("⚠️ Still dry — checking again"));
+    }
+
+  } else if (soilMoisture > wetThresh) {
+    Serial.println(F("\n💦 TOO WET → Skip"));
+    delay(30000);
+  } else {
+    Serial.println(F("\n✅ PERFECT → No action"));
+  }
+
+  // STEP 6: CSV — send same value for both
+  // since we have 1 sensor
+  Serial.print(F("CSV,"));
+  Serial.print(readingCount);   Serial.print(F(","));
+  Serial.print(selectedPlant);  Serial.print(F(","));
+  Serial.print(soilMoisture);   Serial.print(F(","));
+  Serial.print(soilMoisture);   Serial.print(F(","));  // same value!
+  Serial.print(temp,1);         Serial.print(F(","));
+  Serial.println(hum,1);
+
+  Serial.println(F("\n⏳ Next in 5 sec..."));
+  Serial.println(F("================================\n"));
+  delay(5000);
+}
